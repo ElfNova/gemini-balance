@@ -285,61 +285,47 @@ class OpenAIChatService:
     async def _fake_stream_logic_impl(
         self, model: str, payload: Dict[str, Any], api_key: str
     ) -> AsyncGenerator[str, None]:
-        """处理伪流式 (fake stream) 的核心逻辑"""
+        """处理伪流式 (fake stream) 的核心逻辑, 借鉴 hajimi-main 的健壮实现"""
         logger.info(
-            f"Fake streaming enabled for model: {model}. Calling non-streaming endpoint."
+            f"Using robust fake streaming for model: {model}. Calling non-streaming endpoint."
         )
-        keep_sending_empty_data = True
 
-        async def send_empty_data_locally() -> AsyncGenerator[str, None]:
-            """定期发送空数据以保持连接"""
-            while keep_sending_empty_data:
-                await asyncio.sleep(settings.FAKE_STREAM_EMPTY_DATA_INTERVAL_SECONDS)
-                if keep_sending_empty_data:
-                    empty_chunk = self.response_handler.handle_response({}, model, stream=True, finish_reason='stop', usage_metadata=None)
-                    yield f"data: {json.dumps(empty_chunk)}\n\n"
-                    logger.debug("Sent empty data chunk for fake stream heartbeat.")
-
-        empty_data_generator = send_empty_data_locally()
-        api_response_task = asyncio.create_task(
+        api_task = asyncio.create_task(
             self.api_client.generate_content(payload, model, api_key)
         )
 
+        while not api_task.done():
+            try:
+                # 等待一小段时间，或者直到任务完成
+                await asyncio.wait_for(asyncio.shield(api_task), timeout=settings.FAKE_STREAM_EMPTY_DATA_INTERVAL_SECONDS)
+            except asyncio.TimeoutError:
+                # 如果超时，说明API任务仍在运行，发送心跳
+                empty_chunk = self.response_handler.handle_response({}, model, stream=True, finish_reason=None, usage_metadata=None)
+                yield f"data: {json.dumps(empty_chunk)}\n\n"
+                logger.debug("Sent heartbeat chunk for fake stream.")
+
+        # 任务完成，获取结果
         try:
-            while not api_response_task.done():
-                try:
-                    next_empty_chunk = await asyncio.wait_for(
-                        empty_data_generator.__anext__(), timeout=0.1
-                    )
-                    yield next_empty_chunk
-                except asyncio.TimeoutError:
-                    pass
-                except (
-                    StopAsyncIteration
-                ):
-                    break
-
-            response = await api_response_task
-        finally:
-            keep_sending_empty_data = False
-
-        if response and response.get("candidates"):
-            response = self.response_handler.handle_response(response, model, stream=True, finish_reason='stop', usage_metadata=response.get("usageMetadata", {}))
-            yield f"data: {json.dumps(response)}\n\n"
-            logger.info(f"Sent full response content for fake stream: {model}")
-        else:
-            error_message = "Failed to get response from model"
-            if (
-                response and isinstance(response, dict) and response.get("error")
-            ):
-                error_details = response.get("error")
-                if isinstance(error_details, dict):
-                    error_message = error_details.get("message", error_message)
-
-            logger.error(
-                f"No candidates or error in response for fake stream model {model}: {response}"
-            )
-            error_chunk = self.response_handler.handle_response({}, model, stream=True, finish_reason='stop', usage_metadata=None)
+            response = await api_task
+            if response and response.get("candidates"):
+                # 发送包含完整内容的最终块
+                final_chunk = self.response_handler.handle_response(response, model, stream=True, finish_reason='stop', usage_metadata=response.get("usageMetadata", {}))
+                yield f"data: {json.dumps(final_chunk)}\n\n"
+                logger.info(f"Sent full response content for fake stream: {model}")
+            else:
+                # 处理没有有效响应的情况
+                error_message = "Failed to get valid response from model"
+                if response and isinstance(response, dict) and response.get("error"):
+                    error_details = response.get("error")
+                    if isinstance(error_details, dict):
+                        error_message = error_details.get("message", error_message)
+                logger.error(f"No candidates or error in response for fake stream model {model}: {response}")
+                error_chunk = self.response_handler.handle_response({"error": {"message": error_message}}, model, stream=True, finish_reason='stop', usage_metadata=None)
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+        except Exception as e:
+            # 处理API调用本身发生的异常
+            logger.error(f"API call within fake stream failed: {e}")
+            error_chunk = self.response_handler.handle_response({"error": {"message": str(e)}}, model, stream=True, finish_reason='stop', usage_metadata=None)
             yield f"data: {json.dumps(error_chunk)}\n\n"
 
     async def _real_stream_logic_impl(
