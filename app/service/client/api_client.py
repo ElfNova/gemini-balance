@@ -96,7 +96,7 @@ class GeminiApiClient(ApiClient):
             return response.json()
 
     async def stream_generate_content(self, payload: Dict[str, Any], model: str, api_key: str) -> AsyncGenerator[str, None]:
-        timeout = httpx.Timeout(self.timeout, read=self.timeout)
+        timeout = httpx.Timeout(600.0, read=600.0)
         model = self._get_real_model(model)
         
         proxy_to_use = None
